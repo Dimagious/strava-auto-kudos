@@ -7,18 +7,14 @@ app.use(express.json());
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const {
-  STRAVA_CLIENT_ID,
-  STRAVA_CLIENT_SECRET,
-  STRAVA_REFRESH_TOKEN,
+  STRAVA_SESSION_COOKIE,
   STRAVA_ATHLETE_ID,
   STRAVA_VERIFY_TOKEN,
-  PORT = 3000,
+  PORT = 3002,
 } = process.env;
 
 const REQUIRED_VARS = [
-  'STRAVA_CLIENT_ID',
-  'STRAVA_CLIENT_SECRET',
-  'STRAVA_REFRESH_TOKEN',
+  'STRAVA_SESSION_COOKIE',
   'STRAVA_ATHLETE_ID',
   'STRAVA_VERIFY_TOKEN',
 ];
@@ -31,65 +27,121 @@ for (const key of REQUIRED_VARS) {
   }
 }
 
-// ─── Token management ─────────────────────────────────────────────────────────
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-let cachedToken = null;
-let tokenExpiresAt = 0;
+// ─── CSRF token ───────────────────────────────────────────────────────────────
 
-async function getAccessToken() {
-  // Return cached token if still valid (with 1 min buffer)
-  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) {
-    return cachedToken;
+let cachedCsrf = null;
+let csrfFetchedAt = 0;
+const CSRF_TTL = 30 * 60 * 1000; // 30 min
+
+async function getCsrfToken() {
+  if (cachedCsrf && Date.now() - csrfFetchedAt < CSRF_TTL) {
+    return cachedCsrf;
   }
 
-  const res = await fetch('https://www.strava.com/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: STRAVA_CLIENT_ID,
-      client_secret: STRAVA_CLIENT_SECRET,
-      refresh_token: STRAVA_REFRESH_TOKEN,
-      grant_type: 'refresh_token',
-    }),
+  const res = await fetch('https://www.strava.com/dashboard', {
+    headers: {
+      Cookie: `_strava4_session=${STRAVA_SESSION_COOKIE}`,
+      'User-Agent': UA,
+    },
   });
 
-  const data = await res.json();
-
-  if (!data.access_token) {
-    throw new Error(`Failed to refresh token: ${JSON.stringify(data)}`);
+  const html = await res.text();
+  const match = html.match(/csrf-token" content="([^"]+)"/);
+  if (!match) {
+    throw new Error('Could not extract CSRF token — session cookie may have expired');
   }
 
-  cachedToken = data.access_token;
-  tokenExpiresAt = data.expires_at * 1000;
-  console.log('[token] Refreshed, valid until', new Date(tokenExpiresAt).toISOString());
-
-  return cachedToken;
+  cachedCsrf = match[1];
+  csrfFetchedAt = Date.now();
+  console.log('[csrf] Token refreshed');
+  return cachedCsrf;
 }
 
-// ─── Strava API ───────────────────────────────────────────────────────────────
+// ─── Strava web API ───────────────────────────────────────────────────────────
 
-async function getFeedActivities(token) {
-  const since = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000); // unix 24h ago
-  const url = `https://www.strava.com/api/v3/activities/following?after=${since}&per_page=200`;
+async function getFeedActivities() {
+  const since = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000);
+  const activities = [];
+  let before = Math.floor(Date.now() / 1000);
+  let pages = 0;
 
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  while (pages < 10) {
+    const url = `https://www.strava.com/dashboard/feed?num_entries=50&activity_type=&before=${before}&cursor_type=time`;
+    const res = await fetch(url, {
+      headers: {
+        Cookie: `_strava4_session=${STRAVA_SESSION_COOKIE}`,
+        'User-Agent': UA,
+        'X-Requested-With': 'XMLHttpRequest',
+        Accept: 'application/json',
+      },
+    });
 
-  if (!res.ok) {
-    throw new Error(`Could not fetch feed: HTTP ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`Feed request failed: HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    const entries = data.entries || [];
+
+    if (entries.length === 0) break;
+
+    let oldestRank = before;
+    let reachedOld = false;
+
+    for (const entry of entries) {
+      if (entry.entity !== 'Activity') continue;
+      const activity = entry.activity;
+      if (!activity) continue;
+
+      const startDate = new Date(activity.startDate).getTime() / 1000;
+      if (startDate < since) {
+        reachedOld = true;
+        continue;
+      }
+
+      activities.push({
+        id: activity.id,
+        name: activity.activityName,
+        athleteName: activity.athlete?.athleteName || 'Unknown',
+        athleteId: activity.athlete?.athleteId,
+        hasKudoed: activity.kudosAndComments?.hasKudoed ?? false,
+        canKudo: activity.kudosAndComments?.canKudo ?? false,
+        ownedByCurrentAthlete: activity.ownedByCurrentAthlete ?? false,
+      });
+
+      if (entry.cursorData?.rank) {
+        oldestRank = Math.min(oldestRank, Math.floor(entry.cursorData.rank / 1000));
+      }
+    }
+
+    if (reachedOld || !data.pagination?.hasMore) break;
+
+    before = oldestRank - 1;
+    pages++;
   }
 
-  return res.json();
+  return activities;
 }
 
-async function giveKudos(token, activityId) {
-  const res = await fetch(`https://www.strava.com/api/v3/activities/${activityId}/kudos`, {
+async function giveKudos(activityId) {
+  const csrf = await getCsrfToken();
+
+  const res = await fetch(`https://www.strava.com/feed/activity/${activityId}/kudo`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
+    headers: {
+      Cookie: `_strava4_session=${STRAVA_SESSION_COOKIE}`,
+      'X-CSRF-Token': csrf,
+      'X-Requested-With': 'XMLHttpRequest',
+      Accept: 'application/json',
+      'Content-Length': '0',
+      'User-Agent': UA,
+      Referer: 'https://www.strava.com/dashboard',
+    },
   });
 
-  return res.status; // 201 = success, 400 = already kudosed or own activity
+  return res.status;
 }
 
 // ─── Core logic ───────────────────────────────────────────────────────────────
@@ -97,39 +149,39 @@ async function giveKudos(token, activityId) {
 async function giveKudosToFeed() {
   console.log('[kudos] Starting kudos run...');
 
-  const token = await getAccessToken();
-  const activities = await getFeedActivities(token);
-
+  const activities = await getFeedActivities();
   console.log(`[kudos] ${activities.length} activities in feed (last 24h)`);
 
   let given = 0;
   let skipped = 0;
 
   for (const activity of activities) {
-    const name = `${activity.athlete.firstname} ${activity.athlete.lastname}`;
-
     // Skip own activities
-    if (String(activity.athlete.id) === String(STRAVA_ATHLETE_ID)) {
+    if (String(activity.athleteId) === String(STRAVA_ATHLETE_ID) || activity.ownedByCurrentAthlete) {
       skipped++;
       continue;
     }
 
-    // Skip already kudosed
-    if (activity.kudosed) {
+    // Skip already kudosed or can't kudo
+    if (activity.hasKudoed || !activity.canKudo) {
       skipped++;
       continue;
     }
 
-    const status = await giveKudos(token, activity.id);
+    const status = await giveKudos(activity.id);
 
-    if (status === 201) {
+    if (status === 200) {
       given++;
-      console.log(`[kudos] ✓ ${name} — "${activity.name}"`);
+      console.log(`[kudos] ✓ ${activity.athleteName} — "${activity.name}"`);
     } else {
-      console.log(`[kudos] ✗ ${name} — "${activity.name}" (status ${status})`);
+      console.log(`[kudos] ✗ ${activity.athleteName} — "${activity.name}" (status ${status})`);
+      // Refresh CSRF on next attempt if auth error
+      if (status === 401 || status === 403) {
+        cachedCsrf = null;
+      }
     }
 
-    // Small delay to respect Strava API rate limits
+    // Small delay to respect rate limits
     await new Promise(r => setTimeout(r, 300));
   }
 
@@ -138,7 +190,6 @@ async function giveKudosToFeed() {
 
 // ─── Webhook ──────────────────────────────────────────────────────────────────
 
-// Strava calls this once during webhook registration to verify your server
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -153,15 +204,12 @@ app.get('/webhook', (req, res) => {
   res.sendStatus(403);
 });
 
-// Strava sends activity events here
 app.post('/webhook', async (req, res) => {
-  // Always respond immediately — Strava expects a fast response
   res.sendStatus(200);
 
   const event = req.body;
   console.log('[webhook] Event received:', event.object_type, event.aspect_type, `owner:${event.owner_id}`);
 
-  // Only trigger when YOU create a new activity
   const isMyNewActivity =
     event.object_type === 'activity' &&
     event.aspect_type === 'create' &&
