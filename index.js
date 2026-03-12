@@ -1,5 +1,7 @@
 require('dotenv').config();
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
@@ -7,17 +9,12 @@ app.use(express.json());
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const {
-  STRAVA_SESSION_COOKIE,
   STRAVA_ATHLETE_ID,
   STRAVA_VERIFY_TOKEN,
   PORT = 3002,
 } = process.env;
 
-const REQUIRED_VARS = [
-  'STRAVA_SESSION_COOKIE',
-  'STRAVA_ATHLETE_ID',
-  'STRAVA_VERIFY_TOKEN',
-];
+const REQUIRED_VARS = ['STRAVA_ATHLETE_ID', 'STRAVA_VERIFY_TOKEN'];
 
 for (const key of REQUIRED_VARS) {
   if (!process.env[key]) {
@@ -28,6 +25,65 @@ for (const key of REQUIRED_VARS) {
 }
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const SESSION_FILE = path.join(__dirname, 'session.txt');
+
+// ─── Session management ───────────────────────────────────────────────────────
+
+let currentSession = null;
+
+function loadSession() {
+  if (fs.existsSync(SESSION_FILE)) {
+    const val = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+    if (val) return val;
+  }
+  // Fallback to .env
+  return process.env.STRAVA_SESSION_COOKIE || null;
+}
+
+function saveSession(value) {
+  if (value === currentSession) return;
+  currentSession = value;
+  fs.writeFileSync(SESSION_FILE, value, 'utf8');
+  console.log('[session] Cookie updated and saved');
+}
+
+function getSession() {
+  if (!currentSession) {
+    currentSession = loadSession();
+    if (!currentSession) {
+      throw new Error('No session cookie found. Add STRAVA_SESSION_COOKIE to .env or session.txt');
+    }
+  }
+  return currentSession;
+}
+
+// Extract session cookie value from Set-Cookie response headers
+function extractSessionCookie(response) {
+  const cookies = response.headers.getSetCookie?.() ?? [];
+  for (const cookie of cookies) {
+    const match = cookie.match(/^_strava4_session=([^;]+)/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+// Wrapper: makes a request and auto-saves new session if Strava rotates it
+async function stravaFetch(url, options = {}) {
+  const session = getSession();
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      ...options.headers,
+      Cookie: `_strava4_session=${session}`,
+      'User-Agent': UA,
+    },
+  });
+
+  const newSession = extractSessionCookie(res);
+  if (newSession) saveSession(newSession);
+
+  return res;
+}
 
 // ─── CSRF token ───────────────────────────────────────────────────────────────
 
@@ -40,15 +96,10 @@ async function getCsrfToken() {
     return cachedCsrf;
   }
 
-  const res = await fetch('https://www.strava.com/dashboard', {
-    headers: {
-      Cookie: `_strava4_session=${STRAVA_SESSION_COOKIE}`,
-      'User-Agent': UA,
-    },
-  });
-
+  const res = await stravaFetch('https://www.strava.com/dashboard');
   const html = await res.text();
   const match = html.match(/csrf-token" content="([^"]+)"/);
+
   if (!match) {
     throw new Error('Could not extract CSRF token — session cookie may have expired');
   }
@@ -69,10 +120,8 @@ async function getFeedActivities() {
 
   while (pages < 10) {
     const url = `https://www.strava.com/dashboard/feed?num_entries=50&activity_type=&before=${before}&cursor_type=time`;
-    const res = await fetch(url, {
+    const res = await stravaFetch(url, {
       headers: {
-        Cookie: `_strava4_session=${STRAVA_SESSION_COOKIE}`,
-        'User-Agent': UA,
         'X-Requested-With': 'XMLHttpRequest',
         Accept: 'application/json',
       },
@@ -84,7 +133,6 @@ async function getFeedActivities() {
 
     const data = await res.json();
     const entries = data.entries || [];
-
     if (entries.length === 0) break;
 
     let oldestRank = before;
@@ -128,18 +176,20 @@ async function getFeedActivities() {
 async function giveKudos(activityId) {
   const csrf = await getCsrfToken();
 
-  const res = await fetch(`https://www.strava.com/feed/activity/${activityId}/kudo`, {
+  const res = await stravaFetch(`https://www.strava.com/feed/activity/${activityId}/kudo`, {
     method: 'POST',
     headers: {
-      Cookie: `_strava4_session=${STRAVA_SESSION_COOKIE}`,
       'X-CSRF-Token': csrf,
       'X-Requested-With': 'XMLHttpRequest',
       Accept: 'application/json',
       'Content-Length': '0',
-      'User-Agent': UA,
       Referer: 'https://www.strava.com/dashboard',
     },
   });
+
+  if (res.status === 401 || res.status === 403) {
+    cachedCsrf = null; // Force refresh on next attempt
+  }
 
   return res.status;
 }
@@ -156,13 +206,11 @@ async function giveKudosToFeed() {
   let skipped = 0;
 
   for (const activity of activities) {
-    // Skip own activities
     if (String(activity.athleteId) === String(STRAVA_ATHLETE_ID) || activity.ownedByCurrentAthlete) {
       skipped++;
       continue;
     }
 
-    // Skip already kudosed or can't kudo
     if (activity.hasKudoed || !activity.canKudo) {
       skipped++;
       continue;
@@ -175,13 +223,8 @@ async function giveKudosToFeed() {
       console.log(`[kudos] ✓ ${activity.athleteName} — "${activity.name}"`);
     } else {
       console.log(`[kudos] ✗ ${activity.athleteName} — "${activity.name}" (status ${status})`);
-      // Refresh CSRF on next attempt if auth error
-      if (status === 401 || status === 403) {
-        cachedCsrf = null;
-      }
     }
 
-    // Small delay to respect rate limits
     await new Promise(r => setTimeout(r, 300));
   }
 
@@ -226,4 +269,13 @@ app.post('/webhook', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[server] ✓ Running on port ${PORT}`);
   console.log(`[server]   Webhook endpoint: POST /webhook`);
+
+  // Validate session on startup
+  try {
+    const s = getSession();
+    console.log(`[session] Loaded (${s.length} chars)`);
+  } catch (err) {
+    console.error(`[session] ❌ ${err.message}`);
+    process.exit(1);
+  }
 });

@@ -1,4 +1,4 @@
-# 🏅 Strava Auto Kudos
+# 👍 Strava Auto Kudos
 
 > Automatically give kudos to everyone in your feed — triggered the moment **you** post a workout.
 
@@ -9,18 +9,25 @@ No third-party services. No subscriptions. Runs on your own server.
 ## How it works
 
 1. You finish a workout and upload it to Strava
-2. Strava sends a signal to your server
-3. The bot gives kudos to everyone in your feed who posted in the last 24 hours (and hasn't received yours yet)
+2. Strava sends a webhook to your server
+3. The bot gives kudos to everyone in your feed who posted in the last 24 hours
 
-That's it. Fully automatic. You train → your friends get kudos.
+Fully automatic. You train → your friends get kudos.
+
+---
+
+## How it authenticates
+
+The bot uses your browser session cookie (`_strava4_session`) to act as you on the Strava website. You copy it once during setup. After that, **the bot automatically captures and saves session renewals** from Strava's responses — so the session stays alive indefinitely as long as the bot is running.
 
 ---
 
 ## Requirements
 
-- A server with a public URL (VPS, home server with port forwarding, etc.)
+- A server with a public HTTPS URL
 - Node.js 18+
-- A free Strava account
+- A Strava account
+- A Strava API app (free, needed for the webhook only)
 
 ---
 
@@ -36,49 +43,17 @@ npm install
 
 ---
 
-### Step 2 — Create a Strava API app
+### Step 2 — Get your session cookie
 
-1. Go to [strava.com/settings/api](https://www.strava.com/settings/api)
-2. Fill in the form:
-   - **Application Name:** anything you want, e.g. `My Kudos Bot`
-   - **Category:** `Other`
-   - **Website:** your server URL or any URL (e.g. `http://localhost`)
-   - **Authorization Callback Domain:** your server domain (e.g. `myserver.com`) or `localhost` for testing
-3. Click **Save** and copy your **Client ID** and **Client Secret**
-
-![Strava API page](docs/strava-api-page.png)
+1. Open [strava.com](https://www.strava.com) in Chrome and log in
+2. Open DevTools → **Application** → **Cookies** → `https://www.strava.com`
+3. Find `_strava4_session` and copy its value
 
 ---
 
-### Step 3 — Get your Refresh Token
+### Step 3 — Find your Athlete ID
 
-This is a one-time step. Open this URL in your browser — replace `YOUR_CLIENT_ID` with the number from Step 2:
-
-```
-https://www.strava.com/oauth/authorize?client_id=YOUR_CLIENT_ID&response_type=code&redirect_uri=http://localhost&approval_prompt=force&scope=activity:read,read_all
-```
-
-1. Click **Authorize**
-2. You'll be redirected to `http://localhost/?...&code=XXXXXXXX` — the page won't load, that's fine
-3. Copy the `code` value from the URL
-
-Now run this in your terminal (replace the values):
-
-```bash
-curl -X POST https://www.strava.com/oauth/token \
-  -d client_id=YOUR_CLIENT_ID \
-  -d client_secret=YOUR_CLIENT_SECRET \
-  -d code=CODE_FROM_URL \
-  -d grant_type=authorization_code
-```
-
-From the response, copy the `refresh_token` value.
-
----
-
-### Step 4 — Find your Athlete ID
-
-Go to your Strava profile in a browser. The URL looks like:
+Go to your Strava profile. The URL looks like:
 
 ```
 https://www.strava.com/athletes/123456789
@@ -88,31 +63,24 @@ Your Athlete ID is that number — `123456789`.
 
 ---
 
-### Step 5 — Configure the bot
-
-Copy the example config file and fill it in:
+### Step 4 — Configure the bot
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` in any text editor and fill in your values:
+Fill in `.env`:
 
 ```env
-STRAVA_CLIENT_ID=123456        # from Step 2
-STRAVA_CLIENT_SECRET=abc...    # from Step 2
-STRAVA_REFRESH_TOKEN=def...    # from Step 3
-STRAVA_ATHLETE_ID=123456789    # from Step 4
-STRAVA_VERIFY_TOKEN=make_up_any_random_string_here
-PORT=3000
+STRAVA_ATHLETE_ID=123456789        # from Step 3
+STRAVA_VERIFY_TOKEN=any_secret     # make up any random string
+STRAVA_SESSION_COOKIE=abc123...    # from Step 2
+PORT=3002
 ```
-
-> **What is `STRAVA_VERIFY_TOKEN`?**
-> It's a password you make up yourself — used once during setup so Strava can verify your server. Write anything you like, e.g. `kudos_bot_secret_42`.
 
 ---
 
-### Step 6 — Start the server
+### Step 5 — Start the server
 
 ```bash
 node index.js
@@ -120,14 +88,23 @@ node index.js
 
 You should see:
 ```
-[server] Running on port 3000
+[session] Loaded (32 chars)
+[server] ✓ Running on port 3002
 ```
+
+---
+
+### Step 6 — Create a Strava API app (for the webhook)
+
+1. Go to [strava.com/settings/api](https://www.strava.com/settings/api)
+2. Fill in the form — Application Name, Category, Website can be anything
+3. Copy your **Client ID** and **Client Secret**
 
 ---
 
 ### Step 7 — Register the webhook with Strava
 
-This tells Strava where to send notifications. Run once (replace values):
+Run once (replace the values):
 
 ```bash
 curl -X POST https://www.strava.com/api/v3/push_subscriptions \
@@ -137,42 +114,59 @@ curl -X POST https://www.strava.com/api/v3/push_subscriptions \
   -F verify_token=YOUR_VERIFY_TOKEN
 ```
 
-If it worked, you'll get a response like `{"id": 12345}`. Done!
+You'll get back `{"id": 12345}`. Done — Strava will now notify your server on every activity.
 
-> ⚠️ Your server must be accessible from the internet for Strava to reach it.
-> If you're testing locally, use [ngrok](https://ngrok.com): `ngrok http 3000` and use the given URL as `callback_url`.
+> Your server must be reachable from the internet (HTTPS). For local testing use [ngrok](https://ngrok.com): `ngrok http 3002`.
 
 ---
 
 ### Step 8 — Test it
 
-Upload any activity to Strava. Watch the server logs:
-
+```bash
+curl -X POST http://localhost:3002/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"object_type":"activity","aspect_type":"create","owner_id":YOUR_ATHLETE_ID,"object_id":1}'
 ```
-[webhook] Your activity 9876543210 detected — starting kudos run
-[kudos] Found 8 activities in feed (last 24h)
+
+Watch the logs:
+```
+[webhook] Your activity 1 detected — giving kudos to feed
+[csrf] Token refreshed
+[kudos] 12 activities in feed (last 24h)
 [kudos] ✓ Anna Smith — "Evening Run"
 [kudos] ✓ Mike Johnson — "Morning Ride"
-[kudos] Done. Given: 8, Skipped: 0
+[kudos] Done — given: 11, skipped: 1
 ```
 
 ---
 
-## Keep it running 24/7 (recommended)
+## Keep it running 24/7
 
-Use [PM2](https://pm2.keymetrics.io/) to keep the bot alive after reboots:
+Use [PM2](https://pm2.keymetrics.io/):
 
 ```bash
-npm install -g pm2
-pm2 start index.js --name strava-kudos
-pm2 save
-pm2 startup   # follow the printed instructions
+npm install pm2          # or: npm install -g pm2
+./node_modules/.bin/pm2 start index.js --name strava-kudos
+./node_modules/.bin/pm2 save
+./node_modules/.bin/pm2 startup  # follow the printed instructions
 ```
 
-To view logs anytime:
+Logs:
 ```bash
-pm2 logs strava-kudos
+./node_modules/.bin/pm2 logs strava-kudos
 ```
+
+---
+
+## Session management
+
+The session cookie is saved to `session.txt` (gitignored) and auto-updated on every request — Strava rotates the cookie value, and the bot captures the new value automatically.
+
+**If the bot stops working** (session was explicitly invalidated — e.g. you changed your Strava password or logged out everywhere):
+
+1. Copy a fresh `_strava4_session` from your browser DevTools
+2. Paste it into `session.txt` on the server (or re-set `STRAVA_SESSION_COOKIE` in `.env`)
+3. Restart the bot: `pm2 restart strava-kudos --update-env`
 
 ---
 
@@ -185,10 +179,10 @@ No. The bot always skips your own workouts.
 Skipped automatically. No duplicates.
 
 **Is it against Strava's Terms of Service?**
-The bot uses the official Strava API. Automated kudos exist in a grey area of their ToS — use at your own discretion.
+Automated kudos are a grey area in Strava's ToS — use at your own discretion.
 
 **Can I run it on multiple accounts?**
-Not out of the box. You'd need separate instances with separate `.env` files.
+Yes — clone the repo into a separate folder with its own `.env` and `session.txt`.
 
 ---
 
@@ -197,6 +191,7 @@ Not out of the box. You'd need separate instances with separate `.env` files.
 ```
 strava-auto-kudos/
 ├── index.js          # Main server
+├── session.txt       # Auto-managed session cookie (gitignored)
 ├── .env.example      # Config template
 ├── package.json
 └── README.md
