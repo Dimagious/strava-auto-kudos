@@ -195,10 +195,17 @@ async function giveKudos(activityId) {
   return res.status;
 }
 
+// ─── Run tracking ─────────────────────────────────────────────────────────────
+
+let lastRunAt = null;
+let lastRunResult = null;
+let nextRunAt = null;
+
 // ─── Core logic ───────────────────────────────────────────────────────────────
 
 async function giveKudosToFeed() {
   console.log('[kudos] Starting kudos run...');
+  lastRunAt = new Date();
 
   const activities = await getFeedActivities();
   console.log(`[kudos] ${activities.length} activities in feed (last 24h)`);
@@ -229,8 +236,20 @@ async function giveKudosToFeed() {
     await new Promise(r => setTimeout(r, 300));
   }
 
+  lastRunResult = { given, skipped, total: activities.length };
   console.log(`[kudos] Done — given: ${given}, skipped: ${skipped}`);
 }
+
+// ─── Status ───────────────────────────────────────────────────────────────
+
+app.get('/status', (req, res) => {
+  res.json({
+    lastRun: lastRunAt ? lastRunAt.toISOString() : null,
+    lastResult: lastRunResult,
+    nextRun: nextRunAt ? nextRunAt.toISOString() : null,
+    uptime: Math.floor(process.uptime()) + 's',
+  });
+});
 
 // ─── Webhook ──────────────────────────────────────────────────────────────────
 
@@ -284,16 +303,25 @@ app.listen(PORT, () => {
   const intervalHours = Math.max(1, parseFloat(KUDOS_INTERVAL_HOURS) || 8);
   const intervalMs = intervalHours * 60 * 60 * 1000;
 
+  function scheduleNext(delayMs) {
+    nextRunAt = new Date(Date.now() + delayMs);
+  }
+
   // First run 30 seconds after startup (let server settle)
+  scheduleNext(30 * 1000);
   setTimeout(() => {
     console.log('[scheduler] Running initial kudos pass...');
-    giveKudosToFeed().catch(err => console.error('[kudos] Error:', err.message));
+    giveKudosToFeed()
+      .catch(err => console.error('[kudos] Error:', err.message))
+      .finally(() => scheduleNext(intervalMs));
   }, 30 * 1000);
 
   // Then repeat on interval
   setInterval(() => {
     console.log(`[scheduler] Periodic kudos run (every ${intervalHours}h)...`);
-    giveKudosToFeed().catch(err => console.error('[kudos] Error:', err.message));
+    giveKudosToFeed()
+      .catch(err => console.error('[kudos] Error:', err.message))
+      .finally(() => scheduleNext(intervalMs));
   }, intervalMs);
 
   console.log(`[scheduler] Kudos will run every ${intervalHours}h (+ on webhook events)`);
