@@ -12,6 +12,7 @@ const {
   STRAVA_ATHLETE_ID,
   STRAVA_VERIFY_TOKEN,
   PORT = 3002,
+  KUDOS_INTERVAL_HOURS = '8',
 } = process.env;
 
 const REQUIRED_VARS = ['STRAVA_ATHLETE_ID', 'STRAVA_VERIFY_TOKEN'];
@@ -278,4 +279,22 @@ app.listen(PORT, () => {
     console.error(`[session] ❌ ${err.message}`);
     process.exit(1);
   }
+
+  // ─── Periodic kudos run ──────────────────────────────────────────────────
+  const intervalHours = Math.max(1, parseFloat(KUDOS_INTERVAL_HOURS) || 8);
+  const intervalMs = intervalHours * 60 * 60 * 1000;
+
+  // First run 30 seconds after startup (let server settle)
+  setTimeout(() => {
+    console.log('[scheduler] Running initial kudos pass...');
+    giveKudosToFeed().catch(err => console.error('[kudos] Error:', err.message));
+  }, 30 * 1000);
+
+  // Then repeat on interval
+  setInterval(() => {
+    console.log(`[scheduler] Periodic kudos run (every ${intervalHours}h)...`);
+    giveKudosToFeed().catch(err => console.error('[kudos] Error:', err.message));
+  }, intervalMs);
+
+  console.log(`[scheduler] Kudos will run every ${intervalHours}h (+ on webhook events)`);
 });
